@@ -1,0 +1,19 @@
+[package]
+name = "maolan-plugin-protocol"
+version = "0.0.1"
+edition = "2024"
+description = "Shared protocol types for Maolan out-of-process plugin hosting"
+authors = ["Maolan Team"]
+license = "BSD-2-Clause"
+repository = "https://github.com/maolan/maolan"
+homepage = "https://maolan.rs"
+readme = "README.md"
+keywords = ["audio", "plugin", "daw", "ipc", "shm"]
+categories = ["multimedia::audio"]
+
+[dependencies]
+libc = "0.2"
+tracing = "0.1"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_System_Memory"] }
