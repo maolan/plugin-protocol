@@ -1,17 +1,31 @@
 use std::io;
-use std::os::unix::io::RawFd;
 use std::time::Duration;
 
-/// Lightweight cross-process event signalling using Unix pipes.
+#[cfg(unix)]
+use std::os::unix::io::RawFd;
+
+/// Lightweight cross-process event signalling.
 ///
-/// Two independent pipes provide bidirectional wake-up:
-/// - `daw_to_host`: DAW writes a byte to wake the host process.
-/// - `host_to_daw`: Host writes a byte to signal completion.
+/// Unix: two independent pipes provide bidirectional wake-up.
+/// Windows: two named auto-reset events provide bidirectional wake-up.
+#[cfg(unix)]
 pub struct EventPair {
     daw_to_host: [RawFd; 2],
     host_to_daw: [RawFd; 2],
 }
 
+#[cfg(windows)]
+pub struct EventPair {
+    daw_to_host: *mut std::ffi::c_void,
+    host_to_daw: *mut std::ffi::c_void,
+    daw_to_host_name: String,
+    host_to_daw_name: String,
+}
+
+unsafe impl Send for EventPair {}
+unsafe impl Sync for EventPair {}
+
+#[cfg(unix)]
 impl EventPair {
     /// Create two pipes. Returns `Err` if `pipe(2)` fails.
     pub fn new() -> io::Result<Self> {
@@ -45,14 +59,20 @@ impl EventPair {
         pair
     }
 
-    // --- DAW side ---
-
     pub fn daw_write_fd(&self) -> RawFd {
         self.daw_to_host[1]
     }
 
     pub fn daw_read_fd(&self) -> RawFd {
         self.host_to_daw[0]
+    }
+
+    pub fn host_read_fd(&self) -> RawFd {
+        self.daw_to_host[0]
+    }
+
+    pub fn host_write_fd(&self) -> RawFd {
+        self.host_to_daw[1]
     }
 
     /// DAW wakes the host.
@@ -63,16 +83,6 @@ impl EventPair {
     /// DAW waits for host completion (with timeout).
     pub fn wait_host(&self, timeout: Duration) -> io::Result<()> {
         read_byte(self.host_to_daw[0], timeout)
-    }
-
-    // --- Host side ---
-
-    pub fn host_read_fd(&self) -> RawFd {
-        self.daw_to_host[0]
-    }
-
-    pub fn host_write_fd(&self) -> RawFd {
-        self.host_to_daw[1]
     }
 
     /// Host waits for DAW wake (with timeout).
@@ -86,7 +96,6 @@ impl EventPair {
     }
 
     /// Close the file descriptors that the DAW side does not need.
-    /// Call this on the DAW after spawning the child.
     pub fn close_daw_unused(&mut self) {
         unsafe {
             libc::close(self.daw_to_host[0]);
@@ -97,7 +106,6 @@ impl EventPair {
     }
 
     /// Close the file descriptors that the host side does not need.
-    /// Call this on the host after constructing from inherited fds.
     pub fn close_host_unused(&mut self) {
         unsafe {
             libc::close(self.daw_to_host[1]);
@@ -108,6 +116,7 @@ impl EventPair {
     }
 }
 
+#[cfg(unix)]
 impl Drop for EventPair {
     fn drop(&mut self) {
         unsafe {
@@ -119,6 +128,7 @@ impl Drop for EventPair {
     }
 }
 
+#[cfg(unix)]
 fn write_byte(fd: RawFd) -> io::Result<()> {
     let buf = [1u8];
     let n = unsafe { libc::write(fd, buf.as_ptr().cast(), 1) };
@@ -129,6 +139,7 @@ fn write_byte(fd: RawFd) -> io::Result<()> {
     }
 }
 
+#[cfg(unix)]
 fn read_byte(fd: RawFd, timeout: Duration) -> io::Result<()> {
     let mut pfd = libc::pollfd {
         fd,
@@ -149,5 +160,188 @@ fn read_byte(fd: RawFd, timeout: Duration) -> io::Result<()> {
         Err(io::Error::last_os_error())
     } else {
         Ok(())
+    }
+}
+
+#[cfg(windows)]
+impl EventPair {
+    /// Create two named auto-reset events.
+    pub fn new() -> io::Result<Self> {
+        use windows_sys::Win32::Foundation::GetLastError;
+        use windows_sys::Win32::System::Threading::CreateEventW;
+
+        let pid = std::process::id();
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let daw_to_host_name = format!("Local\\maolan-d2h-{}-{}", pid, nonce);
+        let host_to_daw_name = format!("Local\\maolan-h2d-{}-{}", pid, nonce);
+
+        let d2h_wide: Vec<u16> = daw_to_host_name
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        let h2d_wide: Vec<u16> = host_to_daw_name
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+
+        let daw_to_host = unsafe { CreateEventW(std::ptr::null_mut(), 0, 0, d2h_wide.as_ptr()) };
+        if daw_to_host.is_null() {
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                format!("CreateEventW failed: {}", unsafe { GetLastError() }),
+            ));
+        }
+        let host_to_daw = unsafe { CreateEventW(std::ptr::null_mut(), 0, 0, h2d_wide.as_ptr()) };
+        if host_to_daw.is_null() {
+            unsafe { windows_sys::Win32::Foundation::CloseHandle(daw_to_host) };
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                format!("CreateEventW failed: {}", unsafe { GetLastError() }),
+            ));
+        }
+
+        Ok(Self {
+            daw_to_host,
+            host_to_daw,
+            daw_to_host_name,
+            host_to_daw_name,
+        })
+    }
+
+    /// Reconstruct from event names (host process).
+    pub fn from_names(daw_to_host_name: &str, host_to_daw_name: &str) -> io::Result<Self> {
+        use windows_sys::Win32::Foundation::GetLastError;
+        use windows_sys::Win32::System::Threading::OpenEventW;
+
+        let d2h_wide: Vec<u16> = daw_to_host_name
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        let h2d_wide: Vec<u16> = host_to_daw_name
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+
+        let daw_to_host = unsafe {
+            OpenEventW(
+                windows_sys::Win32::System::Threading::EVENT_ALL_ACCESS,
+                0,
+                d2h_wide.as_ptr(),
+            )
+        };
+        if daw_to_host.is_null() {
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                format!("OpenEventW failed: {}", unsafe { GetLastError() }),
+            ));
+        }
+        let host_to_daw = unsafe {
+            OpenEventW(
+                windows_sys::Win32::System::Threading::EVENT_ALL_ACCESS,
+                0,
+                h2d_wide.as_ptr(),
+            )
+        };
+        if host_to_daw.is_null() {
+            unsafe { windows_sys::Win32::Foundation::CloseHandle(daw_to_host) };
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                format!("OpenEventW failed: {}", unsafe { GetLastError() }),
+            ));
+        }
+
+        Ok(Self {
+            daw_to_host,
+            host_to_daw,
+            daw_to_host_name: daw_to_host_name.to_string(),
+            host_to_daw_name: host_to_daw_name.to_string(),
+        })
+    }
+
+    pub fn daw_to_host_name(&self) -> &str {
+        &self.daw_to_host_name
+    }
+
+    pub fn host_to_daw_name(&self) -> &str {
+        &self.host_to_daw_name
+    }
+
+    /// DAW wakes the host.
+    pub fn signal_host(&self) -> io::Result<()> {
+        use windows_sys::Win32::Foundation::GetLastError;
+        use windows_sys::Win32::System::Threading::SetEvent;
+        if unsafe { SetEvent(self.daw_to_host) } == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                format!("SetEvent failed: {}", unsafe { GetLastError() }),
+            ));
+        }
+        Ok(())
+    }
+
+    /// DAW waits for host completion (with timeout).
+    pub fn wait_host(&self, timeout: Duration) -> io::Result<()> {
+        self.wait_object(self.host_to_daw, timeout)
+    }
+
+    /// Host waits for DAW wake (with timeout).
+    pub fn wait_daw(&self, timeout: Duration) -> io::Result<()> {
+        self.wait_object(self.daw_to_host, timeout)
+    }
+
+    /// Host signals completion to DAW.
+    pub fn signal_daw(&self) -> io::Result<()> {
+        use windows_sys::Win32::Foundation::GetLastError;
+        use windows_sys::Win32::System::Threading::SetEvent;
+        if unsafe { SetEvent(self.host_to_daw) } == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                format!("SetEvent failed: {}", unsafe { GetLastError() }),
+            ));
+        }
+        Ok(())
+    }
+
+    /// No-op on Windows (events are opened by name).
+    pub fn close_daw_unused(&mut self) {}
+
+    /// No-op on Windows (events are opened by name).
+    pub fn close_host_unused(&mut self) {}
+
+    fn wait_object(&self, handle: *mut std::ffi::c_void, timeout: Duration) -> io::Result<()> {
+        use windows_sys::Win32::Foundation::{GetLastError, WAIT_OBJECT_0, WAIT_TIMEOUT};
+        use windows_sys::Win32::System::Threading::WaitForSingleObject;
+
+        let ms = timeout.as_millis().clamp(0, u32::MAX as u128) as u32;
+        let rc = unsafe { WaitForSingleObject(handle, ms) };
+        if rc == WAIT_OBJECT_0 {
+            Ok(())
+        } else if rc == WAIT_TIMEOUT {
+            Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "WaitForSingleObject timeout",
+            ))
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::Other,
+                format!("WaitForSingleObject failed: {}", unsafe { GetLastError() }),
+            ))
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for EventPair {
+    fn drop(&mut self) {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        if !self.daw_to_host.is_null() {
+            unsafe { CloseHandle(self.daw_to_host) };
+        }
+        if !self.host_to_daw.is_null() {
+            unsafe { CloseHandle(self.host_to_daw) };
+        }
     }
 }

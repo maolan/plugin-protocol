@@ -14,10 +14,10 @@ audio plugins (CLAP, VST3, LV2) in separate processes:
 
 ## Platform support
 
-| Platform | Shared memory | Event pipes |
-|----------|---------------|-------------|
+| Platform | Shared memory | Events |
+|----------|---------------|--------|
 | Unix     | ✅ POSIX `shm_open` / `mmap` | ✅ `pipe(2)` + `poll(2)` |
-| Windows  | 🚧 Stubs (not yet implemented) | N/A |
+| Windows  | ✅ `CreateFileMappingW` / `MapViewOfFile` | ✅ Named auto-reset events (`CreateEventW` / `WaitForSingleObject`) |
 
 ## License
 

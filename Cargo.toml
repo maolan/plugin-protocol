@@ -1,6 +1,6 @@
 [package]
 name = "maolan-plugin-protocol"
-version = "0.0.1"
+version = "0.0.2"
 edition = "2024"
 description = "Shared protocol types for Maolan out-of-process plugin hosting"
 authors = ["Maolan Team"]
@@ -16,4 +16,4 @@ libc = "0.2"
 tracing = "0.1"
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_System_Memory"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_System_Memory", "Win32_System_Threading"] }

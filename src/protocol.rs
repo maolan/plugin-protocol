@@ -1,10 +1,12 @@
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 /// Magic number: "MAOL" in big-endian ASCII.
 pub const MAGIC: u32 = 0x4D41_4F4C;
 
 /// Current protocol version.
-pub const VERSION: u32 = 1;
+/// Version 2: parent_window changed from AtomicU32 to AtomicU64 to support 64-bit HWNDs on Windows.
+/// Version 3: Added MIDI output ring for plugin-generated MIDI events.
+pub const VERSION: u32 = 3;
 
 /// Maximum number of audio channels (main + sidechain combined).
 pub const MAX_CHANNELS: usize = 32;
@@ -38,9 +40,11 @@ pub const PARAM_RING_OFFSET: usize = AUDIO_OFFSET + AUDIO_BUFFER_SIZE;
 pub const MIDI_RING_OFFSET: usize = PARAM_RING_OFFSET + PARAM_RING_SIZE;
 pub const ECHO_RING_OFFSET: usize = MIDI_RING_OFFSET + MIDI_RING_SIZE;
 pub const ECHO_RING_SIZE: usize = RING_CAPACITY * std::mem::size_of::<ParameterEvent>();
+pub const MIDI_OUT_RING_OFFSET: usize = ECHO_RING_OFFSET + ECHO_RING_SIZE;
+pub const MIDI_OUT_RING_SIZE: usize = RING_CAPACITY * std::mem::size_of::<MidiEvent>();
 /// Transport state block (256-byte aligned from here).
 pub const TRANSPORT_OFFSET: usize = {
-    let end = ECHO_RING_OFFSET + ECHO_RING_SIZE;
+    let end = MIDI_OUT_RING_OFFSET + MIDI_OUT_RING_SIZE;
     // Align up to 256 bytes
     (end + 255) & !255
 };
@@ -60,6 +64,8 @@ pub const MIDI_WRITE_IDX_OFFSET: usize = CONTROL_OFFSET + 8;
 pub const MIDI_READ_IDX_OFFSET: usize = CONTROL_OFFSET + 12;
 pub const ECHO_WRITE_IDX_OFFSET: usize = CONTROL_OFFSET + 16;
 pub const ECHO_READ_IDX_OFFSET: usize = CONTROL_OFFSET + 20;
+pub const MIDI_OUT_WRITE_IDX_OFFSET: usize = CONTROL_OFFSET + 24;
+pub const MIDI_OUT_READ_IDX_OFFSET: usize = CONTROL_OFFSET + 28;
 
 // --- Structs ---
 
@@ -137,9 +143,22 @@ pub struct ShmHeader {
     pub request_status: AtomicU32,
     /// Valid bytes in scratch area for state operations
     pub scratch_size: AtomicU32,
-    /// Parent window ID for GUI embedding (X11 window ID on Unix)
-    pub parent_window: AtomicU32,
-    _pad: [u8; 256 - 64],
+    /// Parent window ID for GUI embedding (X11 window ID on Unix, HWND on Windows)
+    pub parent_window: AtomicU64,
+    _pad: [u8; 256 - 72],
+}
+
+impl ShmHeader {
+    /// Load parent_window as a `usize` (handles 32- and 64-bit platforms).
+    pub fn parent_window_usize(&self) -> usize {
+        self.parent_window.load(Ordering::Acquire) as usize
+    }
+
+    /// Store a `usize` parent_window (truncates on 32-bit, but HWNDs/XIDs are
+    /// always within 64 bits).
+    pub fn set_parent_window(&self, window: usize) {
+        self.parent_window.store(window as u64, Ordering::Release);
+    }
 }
 
 impl Default for ShmHeader {
@@ -160,8 +179,8 @@ impl Default for ShmHeader {
             request_type: AtomicU32::new(0),
             request_status: AtomicU32::new(0),
             scratch_size: AtomicU32::new(0),
-            parent_window: AtomicU32::new(0),
-            _pad: [0; 256 - 64],
+            parent_window: AtomicU64::new(0),
+            _pad: [0; 256 - 72],
         }
     }
 }
@@ -276,6 +295,27 @@ pub unsafe fn echo_indices(ptr: *mut u8) -> (*mut AtomicU32, *mut AtomicU32) {
         (
             ptr.add(ECHO_WRITE_IDX_OFFSET) as *mut AtomicU32,
             ptr.add(ECHO_READ_IDX_OFFSET) as *mut AtomicU32,
+        )
+    }
+}
+
+/// Returns a pointer to the MIDI output ring buffer slot array.
+///
+/// # Safety
+/// `ptr` must point to a valid allocation large enough to contain the MIDI out ring.
+pub unsafe fn midi_out_ring_ptr(ptr: *mut u8) -> *mut MidiEvent {
+    unsafe { ptr.add(MIDI_OUT_RING_OFFSET) as *mut MidiEvent }
+}
+
+/// Returns pointers to the MIDI output ring write/read atomics.
+///
+/// # Safety
+/// `ptr` must point to a valid allocation containing the MIDI out ring atomics.
+pub unsafe fn midi_out_indices(ptr: *mut u8) -> (*mut AtomicU32, *mut AtomicU32) {
+    unsafe {
+        (
+            ptr.add(MIDI_OUT_WRITE_IDX_OFFSET) as *mut AtomicU32,
+            ptr.add(MIDI_OUT_READ_IDX_OFFSET) as *mut AtomicU32,
         )
     }
 }

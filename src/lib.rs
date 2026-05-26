@@ -1,4 +1,3 @@
-#[cfg(unix)]
 pub mod events;
 pub mod protocol;
 pub mod ringbuf;
