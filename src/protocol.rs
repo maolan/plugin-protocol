@@ -344,6 +344,37 @@ pub unsafe fn scratch_ptr(ptr: *mut u8) -> *mut u8 {
     unsafe { ptr.add(SCRATCH_OFFSET) }
 }
 
+/// Write a plugin name to the start of the scratch buffer.
+/// The name is encoded as a little-endian u32 length followed by UTF-8 bytes.
+///
+/// # Safety
+/// `ptr` must point to a valid SHM allocation.
+pub unsafe fn write_plugin_name_to_scratch(ptr: *mut u8, name: &str) {
+    unsafe {
+        let scratch = scratch_ptr(ptr);
+        let bytes = name.as_bytes();
+        let len = bytes.len().min(SCRATCH_SIZE - 4);
+        std::ptr::write_unaligned(scratch as *mut u32, len as u32);
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), scratch.add(4), len);
+    }
+}
+
+/// Read a plugin name from the start of the scratch buffer.
+///
+/// # Safety
+/// `ptr` must point to a valid SHM allocation.
+pub unsafe fn read_plugin_name_from_scratch(ptr: *mut u8) -> Option<String> {
+    unsafe {
+        let scratch = scratch_ptr(ptr);
+        let len = std::ptr::read_unaligned(scratch as *mut u32) as usize;
+        if len == 0 || len > SCRATCH_SIZE - 4 {
+            return None;
+        }
+        let bytes = std::slice::from_raw_parts(scratch.add(4), len);
+        String::from_utf8(bytes.to_vec()).ok()
+    }
+}
+
 // --- Static assertions for sizes ---
 
 const _: () = assert!(std::mem::size_of::<ShmHeader>() == 256);
