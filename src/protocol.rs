@@ -375,6 +375,52 @@ pub unsafe fn read_plugin_name_from_scratch(ptr: *mut u8) -> Option<String> {
     }
 }
 
+/// Magic value written before port counts in scratch.
+pub const PORT_COUNTS_MAGIC: u32 = 0x504F_5254; // "PORT"
+
+/// Offset within scratch where port counts are stored (after plugin name).
+const PORT_COUNTS_OFFSET: usize = 1024;
+
+/// Write audio/MIDI port counts to scratch.
+///
+/// # Safety
+/// `ptr` must point to a valid SHM allocation.
+pub unsafe fn write_port_counts_to_scratch(
+    ptr: *mut u8,
+    audio_in: u32,
+    audio_out: u32,
+    midi_in: u32,
+    midi_out: u32,
+) {
+    unsafe {
+        let dest = scratch_ptr(ptr).add(PORT_COUNTS_OFFSET);
+        std::ptr::write_unaligned(dest as *mut u32, PORT_COUNTS_MAGIC);
+        std::ptr::write_unaligned(dest.add(4) as *mut u32, audio_in);
+        std::ptr::write_unaligned(dest.add(8) as *mut u32, audio_out);
+        std::ptr::write_unaligned(dest.add(12) as *mut u32, midi_in);
+        std::ptr::write_unaligned(dest.add(16) as *mut u32, midi_out);
+    }
+}
+
+/// Read audio/MIDI port counts from scratch.
+///
+/// # Safety
+/// `ptr` must point to a valid SHM allocation.
+pub unsafe fn read_port_counts_from_scratch(ptr: *mut u8) -> Option<(u32, u32, u32, u32)> {
+    unsafe {
+        let src = scratch_ptr(ptr).add(PORT_COUNTS_OFFSET);
+        let magic = std::ptr::read_unaligned(src as *mut u32);
+        if magic != PORT_COUNTS_MAGIC {
+            return None;
+        }
+        let audio_in = std::ptr::read_unaligned(src.add(4) as *mut u32);
+        let audio_out = std::ptr::read_unaligned(src.add(8) as *mut u32);
+        let midi_in = std::ptr::read_unaligned(src.add(12) as *mut u32);
+        let midi_out = std::ptr::read_unaligned(src.add(16) as *mut u32);
+        Some((audio_in, audio_out, midi_in, midi_out))
+    }
+}
+
 // --- Static assertions for sizes ---
 
 const _: () = assert!(std::mem::size_of::<ShmHeader>() == 256);
