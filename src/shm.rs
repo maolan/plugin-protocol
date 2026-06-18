@@ -1,7 +1,6 @@
 #[cfg(unix)]
 use std::ffi::CString;
 
-/// Owned mapping of a shared-memory segment.
 pub struct ShmMapping {
     ptr: *mut u8,
     size: usize,
@@ -11,12 +10,10 @@ pub struct ShmMapping {
     handle: *mut std::ffi::c_void,
 }
 
-// Safety: ShmMapping is Send+Sync because the mapped memory is process-shared.
 unsafe impl Send for ShmMapping {}
 unsafe impl Sync for ShmMapping {}
 
 impl ShmMapping {
-    /// Create a new shared-memory segment, truncate to `size`, and map it.
     #[cfg(unix)]
     pub fn create(name: &str, size: usize) -> Result<Self, String> {
         let c_name = CString::new(name).map_err(|e| e.to_string())?;
@@ -60,7 +57,6 @@ impl ShmMapping {
         })
     }
 
-    /// Open an existing shared-memory segment and map it.
     #[cfg(unix)]
     pub fn open_existing(name: &str, size: usize) -> Result<Self, String> {
         let c_name = CString::new(name).map_err(|e| e.to_string())?;
@@ -96,7 +92,6 @@ impl ShmMapping {
         })
     }
 
-    /// Create a new pagefile-backed shared-memory segment on Windows.
     #[cfg(windows)]
     pub fn create(name: &str, size: usize) -> Result<Self, String> {
         use windows_sys::Win32::Foundation::{GetLastError, INVALID_HANDLE_VALUE};
@@ -138,7 +133,6 @@ impl ShmMapping {
         })
     }
 
-    /// Open an existing shared-memory segment on Windows.
     #[cfg(windows)]
     pub fn open_existing(name: &str, size: usize) -> Result<Self, String> {
         use windows_sys::Win32::Foundation::{CloseHandle, GetLastError};
@@ -171,22 +165,18 @@ impl ShmMapping {
         })
     }
 
-    /// Raw pointer to the start of the mapping.
     pub fn as_ptr(&self) -> *mut u8 {
         self.ptr
     }
 
-    /// Size of the mapping in bytes.
     pub fn size(&self) -> usize {
         self.size
     }
 
-    /// Name used to create/open the segment.
     pub fn name(&self) -> &str {
         &self.name
     }
 
-    /// Unlink the underlying POSIX shared-memory object.
     #[cfg(unix)]
     pub fn unlink(name: &str) -> Result<(), String> {
         let c_name = CString::new(name).map_err(|e| e.to_string())?;
