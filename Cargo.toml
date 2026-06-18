@@ -1,6 +1,6 @@
 [package]
 name = "maolan-plugin-protocol"
-version = "0.0.5"
+version = "0.0.6"
 edition = "2024"
 description = "Shared protocol types for Maolan out-of-process plugin hosting"
 authors = ["Maolan Team"]

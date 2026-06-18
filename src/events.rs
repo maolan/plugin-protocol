@@ -292,6 +292,52 @@ impl EventPair {
         self.wait_object(self.daw_to_host, timeout)
     }
 
+    /// Host waits for DAW wake (with timeout) while pumping the Win32 message queue.
+    pub fn wait_daw_with_message_pump(&self, timeout: Duration) -> io::Result<()> {
+        use windows_sys::Win32::Foundation::{GetLastError, WAIT_OBJECT_0, WAIT_TIMEOUT};
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            DispatchMessageW, MSG, MsgWaitForMultipleObjects, PM_REMOVE, PeekMessageW, QS_ALLINPUT,
+            TranslateMessage,
+        };
+
+        let start = std::time::Instant::now();
+        let handles = [self.daw_to_host];
+        let ms_total = timeout.as_millis().clamp(0, u32::MAX as u128) as u32;
+
+        loop {
+            let elapsed = start.elapsed().as_millis().clamp(0, u32::MAX as u128) as u32;
+            let remaining = ms_total.saturating_sub(elapsed);
+
+            let rc = unsafe {
+                MsgWaitForMultipleObjects(1, handles.as_ptr(), 0, remaining, QS_ALLINPUT)
+            };
+
+            if rc == WAIT_OBJECT_0 {
+                return Ok(());
+            } else if rc == WAIT_OBJECT_0 + 1 {
+                unsafe {
+                    let mut msg: MSG = std::mem::zeroed();
+                    while PeekMessageW(&mut msg, std::ptr::null_mut(), 0, 0, PM_REMOVE) != 0 {
+                        TranslateMessage(&msg);
+                        DispatchMessageW(&msg);
+                    }
+                }
+            } else if rc == WAIT_TIMEOUT {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "MsgWaitForMultipleObjects timeout",
+                ));
+            } else {
+                return Err(io::Error::new(
+                    io::ErrorKind::Other,
+                    format!("MsgWaitForMultipleObjects failed: {}", unsafe {
+                        GetLastError()
+                    }),
+                ));
+            }
+        }
+    }
+
     /// Host signals completion to DAW.
     pub fn signal_daw(&self) -> io::Result<()> {
         use windows_sys::Win32::Foundation::GetLastError;
