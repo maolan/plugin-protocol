@@ -137,7 +137,8 @@ pub struct ShmHeader {
     pub block_size: AtomicU32,
     pub num_input_channels: AtomicU32,
     pub num_output_channels: AtomicU32,
-    /// Request type: 0 = none, 1 = save_state, 2 = restore_state, 3 = gui_show, 4 = gui_hide
+    /// Request type: 0 = none, 1 = save_state, 2 = restore_state, 3 = gui_show, 4 = gui_hide,
+    /// 5 = set_resource_directory, 6 = enumerate_file_references, 7 = update_file_reference
     pub request_type: AtomicU32,
     /// Request status: 0 = pending, 1 = success, 2 = error
     pub request_status: AtomicU32,
@@ -418,6 +419,201 @@ pub unsafe fn read_port_counts_from_scratch(ptr: *mut u8) -> Option<(u32, u32, u
         let midi_in = std::ptr::read_unaligned(src.add(12) as *mut u32);
         let midi_out = std::ptr::read_unaligned(src.add(16) as *mut u32);
         Some((audio_in, audio_out, midi_in, midi_out))
+    }
+}
+
+/// Magic value written before file-reference string list in scratch.
+pub const FILE_REFS_MAGIC: u32 = 0x4649_4C45; // "FILE"
+
+/// Offset within scratch where file-reference string list is stored.
+const FILE_REFS_OFFSET: usize = 2048;
+
+/// Maximum total bytes available for the file-reference list.
+const FILE_REFS_MAX_SIZE: usize = SCRATCH_SIZE - FILE_REFS_OFFSET;
+
+/// A file reference returned by a plugin, paired with its plugin-side index.
+pub type FileReference = (u32, String);
+
+/// Write a list of file-reference (index, path) pairs to scratch.
+/// Format: magic (u32), count (u32), then for each entry:
+///   index (u32), length (u32) followed by UTF-8 bytes.
+///
+/// # Safety
+/// `ptr` must point to a valid SHM allocation.
+pub unsafe fn write_file_references_to_scratch(
+    ptr: *mut u8,
+    refs: &[FileReference],
+) -> Result<(), String> {
+    unsafe {
+        let mut dest = scratch_ptr(ptr).add(FILE_REFS_OFFSET);
+        let mut remaining = FILE_REFS_MAX_SIZE;
+        if remaining < 8 {
+            return Err("scratch too small for file references".to_string());
+        }
+        std::ptr::write_unaligned(dest as *mut u32, FILE_REFS_MAGIC);
+        dest = dest.add(4);
+        remaining -= 4;
+        let count = refs.len().min(u32::MAX as usize) as u32;
+        std::ptr::write_unaligned(dest as *mut u32, count);
+        dest = dest.add(4);
+        remaining -= 4;
+        for (index, path) in refs.iter().take(count as usize) {
+            if remaining < 8 {
+                return Err("scratch overflow writing file references".to_string());
+            }
+            std::ptr::write_unaligned(dest as *mut u32, *index);
+            dest = dest.add(4);
+            remaining -= 4;
+            let bytes = path.as_bytes();
+            let len = bytes
+                .len()
+                .min(u32::MAX as usize)
+                .min(remaining.saturating_sub(4));
+            if len < bytes.len() {
+                return Err("scratch overflow writing file references".to_string());
+            }
+            std::ptr::write_unaligned(dest as *mut u32, len as u32);
+            dest = dest.add(4);
+            remaining -= 4;
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), dest, len);
+            dest = dest.add(len);
+            remaining -= len;
+        }
+        Ok(())
+    }
+}
+
+/// Read a list of file-reference (index, path) pairs from scratch.
+///
+/// # Safety
+/// `ptr` must point to a valid SHM allocation.
+pub unsafe fn read_file_references_from_scratch(ptr: *mut u8) -> Option<Vec<FileReference>> {
+    unsafe {
+        let mut src = scratch_ptr(ptr).add(FILE_REFS_OFFSET);
+        let mut remaining = FILE_REFS_MAX_SIZE;
+        if remaining < 8 {
+            return None;
+        }
+        let magic = std::ptr::read_unaligned(src as *mut u32);
+        if magic != FILE_REFS_MAGIC {
+            return None;
+        }
+        src = src.add(4);
+        remaining -= 4;
+        let count = std::ptr::read_unaligned(src as *mut u32) as usize;
+        src = src.add(4);
+        remaining -= 4;
+        let mut refs = Vec::with_capacity(count);
+        for _ in 0..count {
+            if remaining < 8 {
+                return None;
+            }
+            let index = std::ptr::read_unaligned(src as *mut u32);
+            src = src.add(4);
+            remaining -= 4;
+            let len = std::ptr::read_unaligned(src as *mut u32) as usize;
+            src = src.add(4);
+            remaining -= 4;
+            if len > remaining {
+                return None;
+            }
+            let bytes = std::slice::from_raw_parts(src, len);
+            let path = String::from_utf8(bytes.to_vec()).ok()?;
+            refs.push((index, path));
+            src = src.add(len);
+            remaining -= len;
+        }
+        Some(refs)
+    }
+}
+
+/// Write a resource-directory / base-directory path to scratch.
+/// Format: magic (u32), length (u32), UTF-8 bytes.
+///
+/// # Safety
+/// `ptr` must point to a valid SHM allocation.
+pub unsafe fn write_resource_directory_to_scratch(ptr: *mut u8, path: &str) -> Result<(), String> {
+    unsafe {
+        let scratch = scratch_ptr(ptr);
+        let bytes = path.as_bytes();
+        let len = bytes.len().min(SCRATCH_SIZE - 8);
+        if len < bytes.len() {
+            return Err("resource directory path too long".to_string());
+        }
+        std::ptr::write_unaligned(scratch as *mut u32, FILE_REFS_MAGIC);
+        std::ptr::write_unaligned(scratch.add(4) as *mut u32, len as u32);
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), scratch.add(8), len);
+        Ok(())
+    }
+}
+
+/// Read a resource-directory / base-directory path from scratch.
+///
+/// # Safety
+/// `ptr` must point to a valid SHM allocation.
+pub unsafe fn read_resource_directory_from_scratch(ptr: *mut u8) -> Option<String> {
+    unsafe {
+        let scratch = scratch_ptr(ptr);
+        let magic = std::ptr::read_unaligned(scratch as *mut u32);
+        if magic != FILE_REFS_MAGIC {
+            return None;
+        }
+        let len = std::ptr::read_unaligned(scratch.add(4) as *mut u32) as usize;
+        if len == 0 || len > SCRATCH_SIZE - 8 {
+            return None;
+        }
+        let bytes = std::slice::from_raw_parts(scratch.add(8), len);
+        String::from_utf8(bytes.to_vec()).ok()
+    }
+}
+
+/// Magic value for a single file-reference update in scratch.
+pub const FILE_REF_UPDATE_MAGIC: u32 = 0x5550_4441; // "UPDA"
+
+/// Write a file-reference update (index + new path) to scratch.
+/// Format: magic (u32), index (u32), length (u32), UTF-8 bytes.
+///
+/// # Safety
+/// `ptr` must point to a valid SHM allocation.
+pub unsafe fn write_file_reference_update_to_scratch(
+    ptr: *mut u8,
+    index: u32,
+    path: &str,
+) -> Result<(), String> {
+    unsafe {
+        let scratch = scratch_ptr(ptr);
+        let bytes = path.as_bytes();
+        let len = bytes.len().min(SCRATCH_SIZE - 12);
+        if len < bytes.len() {
+            return Err("file-reference update path too long".to_string());
+        }
+        std::ptr::write_unaligned(scratch as *mut u32, FILE_REF_UPDATE_MAGIC);
+        std::ptr::write_unaligned(scratch.add(4) as *mut u32, index);
+        std::ptr::write_unaligned(scratch.add(8) as *mut u32, len as u32);
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), scratch.add(12), len);
+        Ok(())
+    }
+}
+
+/// Read a file-reference update (index + new path) from scratch.
+///
+/// # Safety
+/// `ptr` must point to a valid SHM allocation.
+pub unsafe fn read_file_reference_update_from_scratch(ptr: *mut u8) -> Option<(u32, String)> {
+    unsafe {
+        let scratch = scratch_ptr(ptr);
+        let magic = std::ptr::read_unaligned(scratch as *mut u32);
+        if magic != FILE_REF_UPDATE_MAGIC {
+            return None;
+        }
+        let index = std::ptr::read_unaligned(scratch.add(4) as *mut u32);
+        let len = std::ptr::read_unaligned(scratch.add(8) as *mut u32) as usize;
+        if len == 0 || len > SCRATCH_SIZE - 12 {
+            return None;
+        }
+        let bytes = std::slice::from_raw_parts(scratch.add(12), len);
+        let path = String::from_utf8(bytes.to_vec()).ok()?;
+        Some((index, path))
     }
 }
 
