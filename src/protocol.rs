@@ -146,7 +146,9 @@ pub struct ShmHeader {
     pub scratch_size: AtomicU32,
     /// Parent window ID for GUI embedding (X11 window ID on Unix, HWND on Windows)
     pub parent_window: AtomicU64,
-    _pad: [u8; 256 - 72],
+    /// Set to 1 by the plugin-host when the plugin calls clap_host_state.mark_dirty()
+    pub state_dirty: AtomicU32,
+    _pad: [u8; 256 - 76],
 }
 
 impl ShmHeader {
@@ -181,7 +183,8 @@ impl Default for ShmHeader {
             request_status: AtomicU32::new(0),
             scratch_size: AtomicU32::new(0),
             parent_window: AtomicU64::new(0),
-            _pad: [0; 256 - 72],
+            state_dirty: AtomicU32::new(0),
+            _pad: [0; 256 - 76],
         }
     }
 }
