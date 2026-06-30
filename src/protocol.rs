@@ -6,7 +6,8 @@ pub const MAGIC: u32 = 0x4D41_4F4C;
 /// Current protocol version.
 /// Version 2: parent_window changed from AtomicU32 to AtomicU64 to support 64-bit HWNDs on Windows.
 /// Version 3: Added MIDI output ring for plugin-generated MIDI events.
-pub const VERSION: u32 = 3;
+/// Version 4: Per-port MIDI input/output rings (MAX_MIDI_PORTS each direction).
+pub const VERSION: u32 = 4;
 
 /// Maximum number of audio channels (main + sidechain combined).
 pub const MAX_CHANNELS: usize = 32;
@@ -20,12 +21,22 @@ pub const MAX_BLOCK_SIZE: usize = 4096;
 /// Capacity of each ring buffer in slots (power of two).
 pub const RING_CAPACITY: usize = 4096;
 
+/// Maximum number of MIDI ports per direction.
+/// Runtime counts may be lower; this is the SHM capacity.
+pub const MAX_MIDI_PORTS: usize = 16;
+
 // --- Section sizes ---
 pub const HEADER_SIZE: usize = 256;
 pub const CONTROL_SIZE: usize = 256;
 pub const AUDIO_BUFFER_SIZE: usize = MAX_CHANNELS * NUM_BUSES * MAX_BLOCK_SIZE * 4; // f32
 pub const PARAM_RING_SIZE: usize = RING_CAPACITY * std::mem::size_of::<ParameterEvent>();
+/// Size of the data area for one MIDI port ring (event slots only).
 pub const MIDI_RING_SIZE: usize = RING_CAPACITY * std::mem::size_of::<MidiEvent>();
+/// Size of one MIDI port ring area including embedded write/read atomics.
+pub const MIDI_PORT_RING_SIZE: usize = {
+    let raw = 8 + MIDI_RING_SIZE; // head + tail atomics + event slots
+    (raw + 15) & !15 // align up to 16 bytes for MidiEvent
+};
 pub const TRANSPORT_SIZE: usize = 256;
 pub const SCRATCH_SIZE: usize = 65536;
 
@@ -36,15 +47,21 @@ pub const CONTROL_OFFSET: usize = HEADER_SIZE;
 pub const AUDIO_OFFSET: usize = HEADER_SIZE + CONTROL_SIZE;
 /// Parameter ring buffer.
 pub const PARAM_RING_OFFSET: usize = AUDIO_OFFSET + AUDIO_BUFFER_SIZE;
-/// MIDI ring buffer.
-pub const MIDI_RING_OFFSET: usize = PARAM_RING_OFFSET + PARAM_RING_SIZE;
-pub const ECHO_RING_OFFSET: usize = MIDI_RING_OFFSET + MIDI_RING_SIZE;
+/// Echo/parameter-change ring buffer.
+pub const ECHO_RING_OFFSET: usize = PARAM_RING_OFFSET + PARAM_RING_SIZE;
 pub const ECHO_RING_SIZE: usize = RING_CAPACITY * std::mem::size_of::<ParameterEvent>();
-pub const MIDI_OUT_RING_OFFSET: usize = ECHO_RING_OFFSET + ECHO_RING_SIZE;
-pub const MIDI_OUT_RING_SIZE: usize = RING_CAPACITY * std::mem::size_of::<MidiEvent>();
+/// Per-port MIDI input rings start after the echo ring.
+pub const MIDI_IN_RINGS_OFFSET: usize = {
+    let end = ECHO_RING_OFFSET + ECHO_RING_SIZE;
+    (end + 255) & !255
+};
+pub const MIDI_IN_RINGS_SIZE: usize = MAX_MIDI_PORTS * MIDI_PORT_RING_SIZE;
+/// Per-port MIDI output rings follow the input rings.
+pub const MIDI_OUT_RINGS_OFFSET: usize = MIDI_IN_RINGS_OFFSET + MIDI_IN_RINGS_SIZE;
+pub const MIDI_OUT_RINGS_SIZE: usize = MAX_MIDI_PORTS * MIDI_PORT_RING_SIZE;
 /// Transport state block (256-byte aligned from here).
 pub const TRANSPORT_OFFSET: usize = {
-    let end = MIDI_OUT_RING_OFFSET + MIDI_OUT_RING_SIZE;
+    let end = MIDI_OUT_RINGS_OFFSET + MIDI_OUT_RINGS_SIZE;
     // Align up to 256 bytes
     (end + 255) & !255
 };
@@ -60,12 +77,8 @@ pub const SHM_SIZE: usize = 4 * 1024 * 1024;
 // --- Control-area indices (all 4-byte atomics inside CONTROL_OFFSET..CONTROL_OFFSET+256) ---
 pub const PARAM_WRITE_IDX_OFFSET: usize = CONTROL_OFFSET;
 pub const PARAM_READ_IDX_OFFSET: usize = CONTROL_OFFSET + 4;
-pub const MIDI_WRITE_IDX_OFFSET: usize = CONTROL_OFFSET + 8;
-pub const MIDI_READ_IDX_OFFSET: usize = CONTROL_OFFSET + 12;
-pub const ECHO_WRITE_IDX_OFFSET: usize = CONTROL_OFFSET + 16;
-pub const ECHO_READ_IDX_OFFSET: usize = CONTROL_OFFSET + 20;
-pub const MIDI_OUT_WRITE_IDX_OFFSET: usize = CONTROL_OFFSET + 24;
-pub const MIDI_OUT_READ_IDX_OFFSET: usize = CONTROL_OFFSET + 28;
+pub const ECHO_WRITE_IDX_OFFSET: usize = CONTROL_OFFSET + 8;
+pub const ECHO_READ_IDX_OFFSET: usize = CONTROL_OFFSET + 12;
 
 // --- Structs ---
 
@@ -137,6 +150,10 @@ pub struct ShmHeader {
     pub block_size: AtomicU32,
     pub num_input_channels: AtomicU32,
     pub num_output_channels: AtomicU32,
+    /// Number of MIDI input ports actually used by the plugin (<= MAX_MIDI_PORTS).
+    pub midi_in_port_count: AtomicU32,
+    /// Number of MIDI output ports actually used by the plugin (<= MAX_MIDI_PORTS).
+    pub midi_out_port_count: AtomicU32,
     /// Request type: 0 = none, 1 = save_state, 2 = restore_state, 3 = gui_show, 4 = gui_hide,
     /// 5 = set_resource_directory, 6 = enumerate_file_references, 7 = update_file_reference
     pub request_type: AtomicU32,
@@ -148,7 +165,7 @@ pub struct ShmHeader {
     pub parent_window: AtomicU64,
     /// Set to 1 by the plugin-host when the plugin calls clap_host_state.mark_dirty()
     pub state_dirty: AtomicU32,
-    _pad: [u8; 256 - 76],
+    _pad: [u8; 256 - 84],
 }
 
 impl ShmHeader {
@@ -179,12 +196,14 @@ impl Default for ShmHeader {
             block_size: AtomicU32::new(0),
             num_input_channels: AtomicU32::new(0),
             num_output_channels: AtomicU32::new(0),
+            midi_in_port_count: AtomicU32::new(0),
+            midi_out_port_count: AtomicU32::new(0),
             request_type: AtomicU32::new(0),
             request_status: AtomicU32::new(0),
             scratch_size: AtomicU32::new(0),
             parent_window: AtomicU64::new(0),
             state_dirty: AtomicU32::new(0),
-            _pad: [0; 256 - 76],
+            _pad: [0; 256 - 84],
         }
     }
 }
@@ -261,27 +280,6 @@ pub unsafe fn param_indices(ptr: *mut u8) -> (*mut AtomicU32, *mut AtomicU32) {
     }
 }
 
-/// Returns a pointer to the MIDI ring buffer slot array.
-///
-/// # Safety
-/// `ptr` must point to a valid allocation large enough to contain the MIDI ring.
-pub unsafe fn midi_ring_ptr(ptr: *mut u8) -> *mut MidiEvent {
-    unsafe { ptr.add(MIDI_RING_OFFSET) as *mut MidiEvent }
-}
-
-/// Returns pointers to the MIDI ring write/read atomics.
-///
-/// # Safety
-/// `ptr` must point to a valid allocation containing the MIDI ring atomics.
-pub unsafe fn midi_indices(ptr: *mut u8) -> (*mut AtomicU32, *mut AtomicU32) {
-    unsafe {
-        (
-            ptr.add(MIDI_WRITE_IDX_OFFSET) as *mut AtomicU32,
-            ptr.add(MIDI_READ_IDX_OFFSET) as *mut AtomicU32,
-        )
-    }
-}
-
 /// Returns a pointer to the echo ring buffer slot array.
 ///
 /// # Safety
@@ -303,25 +301,46 @@ pub unsafe fn echo_indices(ptr: *mut u8) -> (*mut AtomicU32, *mut AtomicU32) {
     }
 }
 
-/// Returns a pointer to the MIDI output ring buffer slot array.
-///
-/// # Safety
-/// `ptr` must point to a valid allocation large enough to contain the MIDI out ring.
-pub unsafe fn midi_out_ring_ptr(ptr: *mut u8) -> *mut MidiEvent {
-    unsafe { ptr.add(MIDI_OUT_RING_OFFSET) as *mut MidiEvent }
+const fn midi_port_ring_offset(base_offset: usize, port: usize) -> usize {
+    base_offset + port * MIDI_PORT_RING_SIZE
 }
 
-/// Returns pointers to the MIDI output ring write/read atomics.
+/// Returns pointers to the embedded write/read atomics for a MIDI input port ring.
 ///
 /// # Safety
-/// `ptr` must point to a valid allocation containing the MIDI out ring atomics.
-pub unsafe fn midi_out_indices(ptr: *mut u8) -> (*mut AtomicU32, *mut AtomicU32) {
+/// `ptr` must point to a valid allocation and `port` must be < MAX_MIDI_PORTS.
+pub unsafe fn midi_in_indices(ptr: *mut u8, port: usize) -> (*mut AtomicU32, *mut AtomicU32) {
     unsafe {
-        (
-            ptr.add(MIDI_OUT_WRITE_IDX_OFFSET) as *mut AtomicU32,
-            ptr.add(MIDI_OUT_READ_IDX_OFFSET) as *mut AtomicU32,
-        )
+        let base = ptr.add(midi_port_ring_offset(MIDI_IN_RINGS_OFFSET, port));
+        (base as *mut AtomicU32, base.add(4) as *mut AtomicU32)
     }
+}
+
+/// Returns a pointer to the MIDI input port ring buffer slot array.
+///
+/// # Safety
+/// `ptr` must point to a valid allocation and `port` must be < MAX_MIDI_PORTS.
+pub unsafe fn midi_in_ring_ptr(ptr: *mut u8, port: usize) -> *mut MidiEvent {
+    unsafe { ptr.add(midi_port_ring_offset(MIDI_IN_RINGS_OFFSET, port) + 8) as *mut MidiEvent }
+}
+
+/// Returns pointers to the embedded write/read atomics for a MIDI output port ring.
+///
+/// # Safety
+/// `ptr` must point to a valid allocation and `port` must be < MAX_MIDI_PORTS.
+pub unsafe fn midi_out_indices(ptr: *mut u8, port: usize) -> (*mut AtomicU32, *mut AtomicU32) {
+    unsafe {
+        let base = ptr.add(midi_port_ring_offset(MIDI_OUT_RINGS_OFFSET, port));
+        (base as *mut AtomicU32, base.add(4) as *mut AtomicU32)
+    }
+}
+
+/// Returns a pointer to the MIDI output port ring buffer slot array.
+///
+/// # Safety
+/// `ptr` must point to a valid allocation and `port` must be < MAX_MIDI_PORTS.
+pub unsafe fn midi_out_ring_ptr(ptr: *mut u8, port: usize) -> *mut MidiEvent {
+    unsafe { ptr.add(midi_port_ring_offset(MIDI_OUT_RINGS_OFFSET, port) + 8) as *mut MidiEvent }
 }
 
 /// Returns a reference to the transport state.

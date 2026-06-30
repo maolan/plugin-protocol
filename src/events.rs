@@ -158,6 +158,11 @@ fn read_byte(fd: RawFd, timeout: Duration) -> io::Result<()> {
     let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), 1) };
     if n < 0 {
         Err(io::Error::last_os_error())
+    } else if n == 0 {
+        Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "event peer closed the pipe",
+        ))
     } else {
         Ok(())
     }
