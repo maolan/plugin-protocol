@@ -79,6 +79,30 @@ pub const PARAM_WRITE_IDX_OFFSET: usize = CONTROL_OFFSET;
 pub const PARAM_READ_IDX_OFFSET: usize = CONTROL_OFFSET + 4;
 pub const ECHO_WRITE_IDX_OFFSET: usize = CONTROL_OFFSET + 8;
 pub const ECHO_READ_IDX_OFFSET: usize = CONTROL_OFFSET + 12;
+pub const GUI_MODE_OFFSET: usize = CONTROL_OFFSET + 16;
+
+/// GUI mode requested by the DAW.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum GuiMode {
+    /// DAW provides a parent window; plugin UI should be embedded.
+    #[default]
+    Embedded = 0,
+    /// DAW cannot provide a parent window; plugin-host must create a top-level window.
+    Floating = 1,
+}
+
+impl GuiMode {
+    pub fn from_u32(value: u32) -> Self {
+        match value {
+            1 => GuiMode::Floating,
+            _ => GuiMode::Embedded,
+        }
+    }
+
+    pub fn as_u32(self) -> u32 {
+        self as u32
+    }
+}
 
 // --- Structs ---
 
@@ -178,6 +202,26 @@ impl ShmHeader {
     /// always within 64 bits).
     pub fn set_parent_window(&self, window: usize) {
         self.parent_window.store(window as u64, Ordering::Release);
+    }
+
+    fn gui_mode_atomic(&self) -> &AtomicU32 {
+        // SAFETY: GUI_MODE_OFFSET is inside the control area, which is within the
+        // header's 256-byte allocation. The offset is aligned to 4 bytes.
+        unsafe {
+            let base = self as *const Self as *const u8;
+            &*(base.add(GUI_MODE_OFFSET) as *const AtomicU32)
+        }
+    }
+
+    /// Load the requested GUI mode.
+    pub fn gui_mode(&self) -> GuiMode {
+        GuiMode::from_u32(self.gui_mode_atomic().load(Ordering::Acquire))
+    }
+
+    /// Store the requested GUI mode.
+    pub fn set_gui_mode(&self, mode: GuiMode) {
+        self.gui_mode_atomic()
+            .store(mode.as_u32(), Ordering::Release);
     }
 }
 
