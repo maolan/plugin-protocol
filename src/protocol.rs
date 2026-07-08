@@ -179,7 +179,8 @@ pub struct ShmHeader {
     /// Number of MIDI output ports actually used by the plugin (<= MAX_MIDI_PORTS).
     pub midi_out_port_count: AtomicU32,
     /// Request type: 0 = none, 1 = save_state, 2 = restore_state, 3 = gui_show, 4 = gui_hide,
-    /// 5 = set_resource_directory, 6 = enumerate_file_references, 7 = update_file_reference
+    /// 5 = set_resource_directory, 6 = enumerate_file_references, 7 = update_file_reference,
+    /// 8 = enumerate_lv2_control_ports, 9 = enumerate_clap_parameters
     pub request_type: AtomicU32,
     /// Request status: 0 = pending, 1 = success, 2 = error
     pub request_status: AtomicU32,
@@ -632,6 +633,12 @@ pub unsafe fn read_resource_directory_from_scratch(ptr: *mut u8) -> Option<Strin
         String::from_utf8(bytes.to_vec()).ok()
     }
 }
+
+/// Request type: enumerate LV2 control ports (index, name, min, max, value).
+pub const REQUEST_LV2_CONTROL_PORTS: u32 = 8;
+
+/// Request type: enumerate CLAP parameters (id, name, module, min, max, default).
+pub const REQUEST_CLAP_PARAMETERS: u32 = 9;
 
 /// Magic value for a single file-reference update in scratch.
 pub const FILE_REF_UPDATE_MAGIC: u32 = 0x5550_4441; // "UPDA"
