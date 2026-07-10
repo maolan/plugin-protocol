@@ -640,6 +640,12 @@ pub const REQUEST_LV2_CONTROL_PORTS: u32 = 8;
 /// Request type: enumerate CLAP parameters (id, name, module, min, max, default).
 pub const REQUEST_CLAP_PARAMETERS: u32 = 9;
 
+/// Request type: fetch LV2 midnam note names (MIDI note number -> name).
+pub const REQUEST_LV2_MIDNAM: u32 = 10;
+
+/// Request type: fetch CLAP note names (MIDI note number -> name).
+pub const REQUEST_CLAP_NOTE_NAMES: u32 = 11;
+
 /// Magic value for a single file-reference update in scratch.
 pub const FILE_REF_UPDATE_MAGIC: u32 = 0x5550_4441; // "UPDA"
 
