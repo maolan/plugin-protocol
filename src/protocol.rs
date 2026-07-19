@@ -7,7 +7,8 @@ pub const MAGIC: u32 = 0x4D41_4F4C;
 /// Version 2: parent_window changed from AtomicU32 to AtomicU64 to support 64-bit HWNDs on Windows.
 /// Version 3: Added MIDI output ring for plugin-generated MIDI events.
 /// Version 4: Per-port MIDI input/output rings (MAX_MIDI_PORTS each direction).
-pub const VERSION: u32 = 4;
+/// Version 5: Plugin-reported latency in samples.
+pub const VERSION: u32 = 5;
 
 /// Maximum number of audio channels (main + sidechain combined).
 pub const MAX_CHANNELS: usize = 32;
@@ -190,7 +191,9 @@ pub struct ShmHeader {
     pub parent_window: AtomicU64,
     /// Set to 1 by the plugin-host when the plugin calls clap_host_state.mark_dirty()
     pub state_dirty: AtomicU32,
-    _pad: [u8; 256 - 84],
+    /// Current plugin latency in samples, refreshed by the host.
+    pub latency_samples: AtomicU32,
+    _pad: [u8; 256 - 88],
 }
 
 impl ShmHeader {
@@ -248,7 +251,8 @@ impl Default for ShmHeader {
             scratch_size: AtomicU32::new(0),
             parent_window: AtomicU64::new(0),
             state_dirty: AtomicU32::new(0),
-            _pad: [0; 256 - 84],
+            latency_samples: AtomicU32::new(0),
+            _pad: [0; 256 - 88],
         }
     }
 }
