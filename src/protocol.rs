@@ -8,7 +8,8 @@ pub const MAGIC: u32 = 0x4D41_4F4C;
 /// Version 3: Added MIDI output ring for plugin-generated MIDI events.
 /// Version 4: Per-port MIDI input/output rings (MAX_MIDI_PORTS each direction).
 /// Version 5: Plugin-reported latency in samples.
-pub const VERSION: u32 = 5;
+/// Version 6: Added GUI parent API tag for native window handles.
+pub const VERSION: u32 = 6;
 
 /// Maximum number of audio channels (main + sidechain combined).
 pub const MAX_CHANNELS: usize = 32;
@@ -81,6 +82,7 @@ pub const PARAM_READ_IDX_OFFSET: usize = CONTROL_OFFSET + 4;
 pub const ECHO_WRITE_IDX_OFFSET: usize = CONTROL_OFFSET + 8;
 pub const ECHO_READ_IDX_OFFSET: usize = CONTROL_OFFSET + 12;
 pub const GUI_MODE_OFFSET: usize = CONTROL_OFFSET + 16;
+pub const GUI_PARENT_API_OFFSET: usize = CONTROL_OFFSET + 20;
 
 /// GUI mode requested by the DAW.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -97,6 +99,32 @@ impl GuiMode {
         match value {
             1 => GuiMode::Floating,
             _ => GuiMode::Embedded,
+        }
+    }
+
+    pub fn as_u32(self) -> u32 {
+        self as u32
+    }
+}
+
+/// Native window-system API for the GUI parent handle.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum GuiParentApi {
+    /// No native parent handle has been provided.
+    #[default]
+    None = 0,
+    /// X11/Xlib window ID.
+    X11 = 1,
+    /// Wayland surface/object handle.
+    Wayland = 2,
+}
+
+impl GuiParentApi {
+    pub fn from_u32(value: u32) -> Self {
+        match value {
+            1 => GuiParentApi::X11,
+            2 => GuiParentApi::Wayland,
+            _ => GuiParentApi::None,
         }
     }
 
@@ -187,7 +215,7 @@ pub struct ShmHeader {
     pub request_status: AtomicU32,
     /// Valid bytes in scratch area for state operations
     pub scratch_size: AtomicU32,
-    /// Parent window ID for GUI embedding (X11 window ID on Unix, HWND on Windows)
+    /// Parent window ID for GUI embedding. See GUI_PARENT_API_OFFSET for Unix API tagging.
     pub parent_window: AtomicU64,
     /// Set to 1 by the plugin-host when the plugin calls clap_host_state.mark_dirty()
     pub state_dirty: AtomicU32,
@@ -206,6 +234,26 @@ impl ShmHeader {
     /// always within 64 bits).
     pub fn set_parent_window(&self, window: usize) {
         self.parent_window.store(window as u64, Ordering::Release);
+    }
+
+    fn gui_parent_api_atomic(&self) -> &AtomicU32 {
+        // SAFETY: GUI_PARENT_API_OFFSET is inside the control area, which is
+        // within the header's 256-byte allocation. The offset is aligned to 4 bytes.
+        unsafe {
+            let base = self as *const Self as *const u8;
+            &*(base.add(GUI_PARENT_API_OFFSET) as *const AtomicU32)
+        }
+    }
+
+    /// Load the native API of the GUI parent handle.
+    pub fn gui_parent_api(&self) -> GuiParentApi {
+        GuiParentApi::from_u32(self.gui_parent_api_atomic().load(Ordering::Acquire))
+    }
+
+    /// Store the native API of the GUI parent handle.
+    pub fn set_gui_parent_api(&self, api: GuiParentApi) {
+        self.gui_parent_api_atomic()
+            .store(api.as_u32(), Ordering::Release);
     }
 
     fn gui_mode_atomic(&self) -> &AtomicU32 {
