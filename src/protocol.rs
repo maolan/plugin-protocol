@@ -209,7 +209,8 @@ pub struct ShmHeader {
     pub midi_out_port_count: AtomicU32,
     /// Request type: 0 = none, 1 = save_state, 2 = restore_state, 3 = gui_show, 4 = gui_hide,
     /// 5 = set_resource_directory, 6 = enumerate_file_references, 7 = update_file_reference,
-    /// 8 = enumerate_lv2_control_ports, 9 = enumerate_clap_parameters
+    /// 8 = enumerate_lv2_control_ports, 9 = enumerate_clap_parameters,
+    /// 11 = enumerate_clap_note_names, 12 = enumerate_clap_audio_ports
     pub request_type: AtomicU32,
     /// Request status: 0 = pending, 1 = success, 2 = error
     pub request_status: AtomicU32,
@@ -697,6 +698,9 @@ pub const REQUEST_LV2_MIDNAM: u32 = 10;
 
 /// Request type: fetch CLAP note names (MIDI note number -> name).
 pub const REQUEST_CLAP_NOTE_NAMES: u32 = 11;
+
+/// Request type: refresh CLAP audio port counts in scratch.
+pub const REQUEST_CLAP_AUDIO_PORTS: u32 = 12;
 
 /// Magic value for a single file-reference update in scratch.
 pub const FILE_REF_UPDATE_MAGIC: u32 = 0x5550_4441; // "UPDA"
