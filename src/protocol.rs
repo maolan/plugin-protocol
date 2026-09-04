@@ -9,7 +9,10 @@ pub const MAGIC: u32 = 0x4D41_4F4C;
 /// Version 4: Per-port MIDI input/output rings (MAX_MIDI_PORTS each direction).
 /// Version 5: Plugin-reported latency in samples.
 /// Version 6: Added GUI parent API tag for native window handles.
-pub const VERSION: u32 = 6;
+/// Version 7: Replaced file-reference requests (enumerate/update) with
+/// resource-directory requests (collect/enumerate); resource-directory
+/// scratch payload now carries an `is_shared` flag.
+pub const VERSION: u32 = 7;
 
 /// Maximum number of audio channels (main + sidechain combined).
 pub const MAX_CHANNELS: usize = 32;
@@ -210,7 +213,7 @@ pub struct ShmHeader {
     /// Number of MIDI output ports actually used by the plugin (<= MAX_MIDI_PORTS).
     pub midi_out_port_count: AtomicU32,
     /// Request type: 0 = none, 1 = save_state, 2 = restore_state, 3 = gui_show, 4 = gui_hide,
-    /// 5 = set_resource_directory, 6 = enumerate_file_references, 7 = update_file_reference,
+    /// 5 = set_resource_directory, 6 = collect_resources, 7 = enumerate_resource_files,
     /// 8 = enumerate_lv2_control_ports, 9 = enumerate_clap_parameters,
     /// 11 = enumerate_clap_note_names, 12 = enumerate_clap_audio_ports
     pub request_type: AtomicU32,
@@ -544,44 +547,45 @@ pub unsafe fn read_port_counts_from_scratch(ptr: *mut u8) -> Option<(u32, u32, u
     }
 }
 
-/// Magic value written before file-reference string list in scratch.
+/// Magic value written before the resource-file string list in scratch.
 pub const FILE_REFS_MAGIC: u32 = 0x4649_4C45; // "FILE"
 
-/// Offset within scratch where file-reference string list is stored.
+/// Offset within scratch where the resource-file string list is stored.
 const FILE_REFS_OFFSET: usize = 2048;
 
-/// Maximum total bytes available for the file-reference list.
+/// Maximum total bytes available for the resource-file list.
 const FILE_REFS_MAX_SIZE: usize = SCRATCH_SIZE - FILE_REFS_OFFSET;
 
-/// A file reference returned by a plugin, paired with its plugin-side index.
-pub type FileReference = (u32, String);
+/// A resource file used by a plugin in the shared resource folder, paired
+/// with its plugin-side index.
+pub type ResourceFile = (u32, String);
 
-/// Write a list of file-reference (index, path) pairs to scratch.
+/// Write a list of resource files (index, relative path) to scratch.
 /// Format: magic (u32), count (u32), then for each entry:
 ///   index (u32), length (u32) followed by UTF-8 bytes.
 ///
 /// # Safety
 /// `ptr` must point to a valid SHM allocation.
-pub unsafe fn write_file_references_to_scratch(
+pub unsafe fn write_resource_files_to_scratch(
     ptr: *mut u8,
-    refs: &[FileReference],
+    files: &[ResourceFile],
 ) -> Result<(), String> {
     unsafe {
         let mut dest = scratch_ptr(ptr).add(FILE_REFS_OFFSET);
         let mut remaining = FILE_REFS_MAX_SIZE;
         if remaining < 8 {
-            return Err("scratch too small for file references".to_string());
+            return Err("scratch too small for resource files".to_string());
         }
         std::ptr::write_unaligned(dest as *mut u32, FILE_REFS_MAGIC);
         dest = dest.add(4);
         remaining -= 4;
-        let count = refs.len().min(u32::MAX as usize) as u32;
+        let count = files.len().min(u32::MAX as usize) as u32;
         std::ptr::write_unaligned(dest as *mut u32, count);
         dest = dest.add(4);
         remaining -= 4;
-        for (index, path) in refs.iter().take(count as usize) {
+        for (index, path) in files.iter().take(count as usize) {
             if remaining < 8 {
-                return Err("scratch overflow writing file references".to_string());
+                return Err("scratch overflow writing resource files".to_string());
             }
             std::ptr::write_unaligned(dest as *mut u32, *index);
             dest = dest.add(4);
@@ -592,7 +596,7 @@ pub unsafe fn write_file_references_to_scratch(
                 .min(u32::MAX as usize)
                 .min(remaining.saturating_sub(4));
             if len < bytes.len() {
-                return Err("scratch overflow writing file references".to_string());
+                return Err("scratch overflow writing resource files".to_string());
             }
             std::ptr::write_unaligned(dest as *mut u32, len as u32);
             dest = dest.add(4);
@@ -605,11 +609,11 @@ pub unsafe fn write_file_references_to_scratch(
     }
 }
 
-/// Read a list of file-reference (index, path) pairs from scratch.
+/// Read a list of resource files (index, relative path) from scratch.
 ///
 /// # Safety
 /// `ptr` must point to a valid SHM allocation.
-pub unsafe fn read_file_references_from_scratch(ptr: *mut u8) -> Option<Vec<FileReference>> {
+pub unsafe fn read_resource_files_from_scratch(ptr: *mut u8) -> Option<Vec<ResourceFile>> {
     unsafe {
         let mut src = scratch_ptr(ptr).add(FILE_REFS_OFFSET);
         let mut remaining = FILE_REFS_MAX_SIZE;
@@ -625,7 +629,7 @@ pub unsafe fn read_file_references_from_scratch(ptr: *mut u8) -> Option<Vec<File
         let count = std::ptr::read_unaligned(src as *mut u32) as usize;
         src = src.add(4);
         remaining -= 4;
-        let mut refs = Vec::with_capacity(count);
+        let mut files = Vec::with_capacity(count);
         for _ in 0..count {
             if remaining < 8 {
                 return None;
@@ -641,39 +645,44 @@ pub unsafe fn read_file_references_from_scratch(ptr: *mut u8) -> Option<Vec<File
             }
             let bytes = std::slice::from_raw_parts(src, len);
             let path = String::from_utf8(bytes.to_vec()).ok()?;
-            refs.push((index, path));
+            files.push((index, path));
             src = src.add(len);
             remaining -= len;
         }
-        Some(refs)
+        Some(files)
     }
 }
 
-/// Write a resource-directory / base-directory path to scratch.
-/// Format: magic (u32), length (u32), UTF-8 bytes.
+/// Write a resource-directory path and its sharing flag to scratch.
+/// Format: magic (u32), length (u32), UTF-8 bytes, is_shared (u32).
 ///
 /// # Safety
 /// `ptr` must point to a valid SHM allocation.
-pub unsafe fn write_resource_directory_to_scratch(ptr: *mut u8, path: &str) -> Result<(), String> {
+pub unsafe fn write_resource_directory_to_scratch(
+    ptr: *mut u8,
+    path: &str,
+    is_shared: bool,
+) -> Result<(), String> {
     unsafe {
         let scratch = scratch_ptr(ptr);
         let bytes = path.as_bytes();
-        let len = bytes.len().min(SCRATCH_SIZE - 8);
+        let len = bytes.len().min(SCRATCH_SIZE - 12);
         if len < bytes.len() {
             return Err("resource directory path too long".to_string());
         }
         std::ptr::write_unaligned(scratch as *mut u32, FILE_REFS_MAGIC);
         std::ptr::write_unaligned(scratch.add(4) as *mut u32, len as u32);
         std::ptr::copy_nonoverlapping(bytes.as_ptr(), scratch.add(8), len);
+        std::ptr::write_unaligned(scratch.add(8 + len) as *mut u32, is_shared as u32);
         Ok(())
     }
 }
 
-/// Read a resource-directory / base-directory path from scratch.
+/// Read a resource-directory path and its sharing flag from scratch.
 ///
 /// # Safety
 /// `ptr` must point to a valid SHM allocation.
-pub unsafe fn read_resource_directory_from_scratch(ptr: *mut u8) -> Option<String> {
+pub unsafe fn read_resource_directory_from_scratch(ptr: *mut u8) -> Option<(String, bool)> {
     unsafe {
         let scratch = scratch_ptr(ptr);
         let magic = std::ptr::read_unaligned(scratch as *mut u32);
@@ -681,13 +690,23 @@ pub unsafe fn read_resource_directory_from_scratch(ptr: *mut u8) -> Option<Strin
             return None;
         }
         let len = std::ptr::read_unaligned(scratch.add(4) as *mut u32) as usize;
-        if len == 0 || len > SCRATCH_SIZE - 8 {
+        if len == 0 || len > SCRATCH_SIZE - 12 {
             return None;
         }
         let bytes = std::slice::from_raw_parts(scratch.add(8), len);
-        String::from_utf8(bytes.to_vec()).ok()
+        let path = String::from_utf8(bytes.to_vec()).ok()?;
+        let is_shared = std::ptr::read_unaligned(scratch.add(8 + len) as *mut u32) != 0;
+        Some((path, is_shared))
     }
 }
+
+/// Request type: ask the plugin to copy its referenced resources into the
+/// resource directory (`clap_plugin_resource_directory.collect`).
+pub const REQUEST_COLLECT_RESOURCES: u32 = 6;
+
+/// Request type: enumerate the files the plugin uses in the shared resource
+/// folder (`clap_plugin_resource_directory.get_files_count/get_file_path`).
+pub const REQUEST_RESOURCE_FILES: u32 = 7;
 
 /// Request type: enumerate LV2 control ports (index, name, min, max, value).
 pub const REQUEST_LV2_CONTROL_PORTS: u32 = 8;
@@ -703,56 +722,6 @@ pub const REQUEST_CLAP_NOTE_NAMES: u32 = 11;
 
 /// Request type: refresh CLAP audio port counts in scratch.
 pub const REQUEST_CLAP_AUDIO_PORTS: u32 = 12;
-
-/// Magic value for a single file-reference update in scratch.
-pub const FILE_REF_UPDATE_MAGIC: u32 = 0x5550_4441; // "UPDA"
-
-/// Write a file-reference update (index + new path) to scratch.
-/// Format: magic (u32), index (u32), length (u32), UTF-8 bytes.
-///
-/// # Safety
-/// `ptr` must point to a valid SHM allocation.
-pub unsafe fn write_file_reference_update_to_scratch(
-    ptr: *mut u8,
-    index: u32,
-    path: &str,
-) -> Result<(), String> {
-    unsafe {
-        let scratch = scratch_ptr(ptr);
-        let bytes = path.as_bytes();
-        let len = bytes.len().min(SCRATCH_SIZE - 12);
-        if len < bytes.len() {
-            return Err("file-reference update path too long".to_string());
-        }
-        std::ptr::write_unaligned(scratch as *mut u32, FILE_REF_UPDATE_MAGIC);
-        std::ptr::write_unaligned(scratch.add(4) as *mut u32, index);
-        std::ptr::write_unaligned(scratch.add(8) as *mut u32, len as u32);
-        std::ptr::copy_nonoverlapping(bytes.as_ptr(), scratch.add(12), len);
-        Ok(())
-    }
-}
-
-/// Read a file-reference update (index + new path) from scratch.
-///
-/// # Safety
-/// `ptr` must point to a valid SHM allocation.
-pub unsafe fn read_file_reference_update_from_scratch(ptr: *mut u8) -> Option<(u32, String)> {
-    unsafe {
-        let scratch = scratch_ptr(ptr);
-        let magic = std::ptr::read_unaligned(scratch as *mut u32);
-        if magic != FILE_REF_UPDATE_MAGIC {
-            return None;
-        }
-        let index = std::ptr::read_unaligned(scratch.add(4) as *mut u32);
-        let len = std::ptr::read_unaligned(scratch.add(8) as *mut u32) as usize;
-        if len == 0 || len > SCRATCH_SIZE - 12 {
-            return None;
-        }
-        let bytes = std::slice::from_raw_parts(scratch.add(12), len);
-        let path = String::from_utf8(bytes.to_vec()).ok()?;
-        Some((index, path))
-    }
-}
 
 // --- Static assertions for sizes ---
 
