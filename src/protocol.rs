@@ -12,6 +12,16 @@ pub const MAGIC: u32 = 0x4D41_4F4C;
 /// Version 7: Replaced file-reference requests (enumerate/update) with
 /// resource-directory requests (collect/enumerate); resource-directory
 /// scratch payload now carries an `is_shared` flag.
+///
+/// Version 7, protocol crate 0.0.19: Two header fields were added inside
+/// previously-padding bytes (offsets 88 and 92), so the on-the-wire header
+/// layout is unchanged and binaries built against 0.0.18 still interoperate:
+/// - `response_counter` (offset 88): bumped by the plugin-host before it
+///   signals each completed audio block, letting the DAW poll block
+///   completion in shared memory without a syscall.
+/// - `block_response_eventless` (offset 92): set to 1 by the DAW when it will
+///   observe the counter; the host then skips writing the per-block
+///   completion event byte (which would otherwise accumulate in the pipe).
 pub const VERSION: u32 = 7;
 
 /// Maximum number of audio channels (main + sidechain combined).
@@ -88,6 +98,28 @@ pub const ECHO_WRITE_IDX_OFFSET: usize = CONTROL_OFFSET + 8;
 pub const ECHO_READ_IDX_OFFSET: usize = CONTROL_OFFSET + 12;
 pub const GUI_MODE_OFFSET: usize = CONTROL_OFFSET + 16;
 pub const GUI_PARENT_API_OFFSET: usize = CONTROL_OFFSET + 20;
+
+// --- Header field offsets ---
+// The header is `#[repr(C, align(256))]`; offsets below match the field
+// order in `ShmHeader`:
+//   0  magic (u32)                4  version (u32)
+//   8  flags (u32)               12 ready (AtomicU32)
+//  16  heartbeat (AtomicU32)     20 error_code (u32)
+//  24  shutdown_request          28 tasks_issued
+//  32  tasks_completed           36 block_size
+//  40  num_input_channels        44 num_output_channels
+//  48  midi_in_port_count        52 midi_out_port_count
+//  56  request_type              60 request_status
+//  64  scratch_size              68..72 padding
+//  72  parent_window (AtomicU64, 8 bytes)
+//  80  state_dirty               84 latency_samples
+//  88  response_counter (AtomicU32, added 0.0.19, was padding)
+//  92  block_response_eventless (AtomicU32, added 0.0.19, was padding)
+//  96..256 padding
+/// Byte offset of the per-block response counter inside `ShmHeader`.
+pub const RESPONSE_COUNTER_OFFSET: usize = 88;
+/// Byte offset of the eventless block-response flag inside `ShmHeader`.
+pub const BLOCK_RESPONSE_EVENTLESS_OFFSET: usize = 92;
 
 /// GUI mode requested by the DAW.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -227,10 +259,44 @@ pub struct ShmHeader {
     pub state_dirty: AtomicU32,
     /// Current plugin latency in samples, refreshed by the host.
     pub latency_samples: AtomicU32,
-    _pad: [u8; 256 - 88],
+    /// Bumped by the plugin-host (Release) immediately before it reports each
+    /// completed audio block, so the DAW can spin-poll block completion in
+    /// shared memory instead of blocking on the event pipe. Previously part
+    /// of `_pad`.
+    pub response_counter: AtomicU32,
+    /// Set to 1 by the DAW when it observes `response_counter` for block
+    /// completion; the host then omits the per-block completion event byte
+    /// (it would otherwise pile up unread in the pipe). Previously part of
+    /// `_pad`.
+    pub block_response_eventless: AtomicU32,
+    _pad: [u8; 256 - 96],
 }
 
 impl ShmHeader {
+    /// Bump the per-block response counter. Called by the plugin-host right
+    /// before reporting a completed audio block (with the completion event,
+    /// or alone when the DAW runs in eventless counter mode).
+    pub fn mark_block_response(&self) {
+        self.response_counter.fetch_add(1, Ordering::Release);
+    }
+
+    /// Current value of the per-block response counter.
+    pub fn block_response_count(&self) -> u32 {
+        self.response_counter.load(Ordering::Acquire)
+    }
+
+    /// Whether the DAW observes the response counter for block completion.
+    pub fn block_response_eventless(&self) -> bool {
+        self.block_response_eventless.load(Ordering::Acquire) != 0
+    }
+
+    /// Select whether the host should skip the per-block completion event
+    /// byte because the DAW observes `response_counter` instead.
+    pub fn set_block_response_eventless(&self, eventless: bool) {
+        self.block_response_eventless
+            .store(eventless as u32, Ordering::Release);
+    }
+
     /// Load parent_window as a `usize` (handles 32- and 64-bit platforms).
     pub fn parent_window_usize(&self) -> usize {
         self.parent_window.load(Ordering::Acquire) as usize
@@ -306,7 +372,9 @@ impl Default for ShmHeader {
             parent_window: AtomicU64::new(0),
             state_dirty: AtomicU32::new(0),
             latency_samples: AtomicU32::new(0),
-            _pad: [0; 256 - 88],
+            response_counter: AtomicU32::new(0),
+            block_response_eventless: AtomicU32::new(0),
+            _pad: [0; 256 - 96],
         }
     }
 }
@@ -735,6 +803,14 @@ const _: () = assert!(std::mem::size_of::<TransportState>() == 256);
 const _: () = assert!(std::mem::align_of::<TransportState>() == 256);
 const _: () = assert!(LAYOUT_SIZE <= SHM_SIZE);
 
+/// Returns a reference to the per-block response counter.
+///
+/// # Safety
+/// `ptr` must point to a valid allocation containing at least `ShmHeader`'s size.
+pub unsafe fn response_counter_ref(ptr: *mut u8) -> &'static std::sync::atomic::AtomicU32 {
+    unsafe { &*(ptr.add(RESPONSE_COUNTER_OFFSET) as *const std::sync::atomic::AtomicU32) }
+}
+
 /// Wait (spin + yield) until `ready` becomes non-zero or timeout elapses.
 pub fn wait_for_ready(header: &ShmHeader, timeout: std::time::Duration) -> bool {
     let start = std::time::Instant::now();
@@ -745,4 +821,53 @@ pub fn wait_for_ready(header: &ShmHeader, timeout: std::time::Duration) -> bool 
         std::thread::yield_now();
     }
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn response_counter_fields_live_at_offsets_88_and_92() {
+        let header = ShmHeader::default();
+        let base = &header as *const ShmHeader as usize;
+        assert_eq!(
+            &header.response_counter as *const AtomicU32 as usize - base,
+            RESPONSE_COUNTER_OFFSET
+        );
+        assert_eq!(
+            &header.block_response_eventless as *const AtomicU32 as usize - base,
+            BLOCK_RESPONSE_EVENTLESS_OFFSET
+        );
+        // Both fields must sit inside the fixed 256-byte header, after
+        // latency_samples (84) and clear of the parent_window u64 (72..80).
+        const {
+            assert!(RESPONSE_COUNTER_OFFSET >= 88);
+            assert!(BLOCK_RESPONSE_EVENTLESS_OFFSET + 4 <= HEADER_SIZE);
+        }
+    }
+
+    #[test]
+    fn response_counter_handoff_roundtrip() {
+        let mut bytes = vec![0u8; HEADER_SIZE];
+        unsafe {
+            init_shm_layout(bytes.as_mut_ptr(), bytes.len());
+        }
+        let header = unsafe { header_ref(bytes.as_mut_ptr()) };
+        assert_eq!(header.block_response_count(), 0);
+        assert!(!header.block_response_eventless());
+
+        // Host side: two completed blocks, each marked before signalling.
+        header.mark_block_response();
+        header.mark_block_response();
+        // DAW side: reads the counter through the raw-pointer helper, the
+        // same view an engine built against 0.0.18 has of padding bytes
+        // (zero, so its spin fast path simply never triggers).
+        let counter = unsafe { response_counter_ref(bytes.as_mut_ptr()) };
+        assert_eq!(counter.load(Ordering::Acquire), 2);
+        assert_eq!(header.block_response_count(), 2);
+
+        header.set_block_response_eventless(true);
+        assert!(header.block_response_eventless());
+    }
 }
