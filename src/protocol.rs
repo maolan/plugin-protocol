@@ -22,7 +22,8 @@ pub const MAGIC: u32 = 0x4D41_4F4C;
 /// - `block_response_eventless` (offset 92): set to 1 by the DAW when it will
 ///   observe the counter; the host then skips writing the per-block
 ///   completion event byte (which would otherwise accumulate in the pipe).
-pub const VERSION: u32 = 7;
+/// Version 8: Added Cocoa GUI parent API tag and AudioUnit parameter request.
+pub const VERSION: u32 = 8;
 
 /// Maximum number of audio channels (main + sidechain combined).
 pub const MAX_CHANNELS: usize = 32;
@@ -154,6 +155,8 @@ pub enum GuiParentApi {
     X11 = 1,
     /// Wayland surface/object handle.
     Wayland = 2,
+    /// macOS Cocoa window/view handle (`NSWindow *` / `NSView *`).
+    Cocoa = 3,
 }
 
 impl GuiParentApi {
@@ -161,6 +164,7 @@ impl GuiParentApi {
         match value {
             1 => GuiParentApi::X11,
             2 => GuiParentApi::Wayland,
+            3 => GuiParentApi::Cocoa,
             _ => GuiParentApi::None,
         }
     }
@@ -259,15 +263,13 @@ pub struct ShmHeader {
     pub state_dirty: AtomicU32,
     /// Current plugin latency in samples, refreshed by the host.
     pub latency_samples: AtomicU32,
-    /// Bumped by the plugin-host (Release) immediately before it reports each
-    /// completed audio block, so the DAW can spin-poll block completion in
-    /// shared memory instead of blocking on the event pipe. Previously part
-    /// of `_pad`.
+    /// Per-block response counter (offset 88, previously padding): bumped by
+    /// the plugin-host before it signals each completed audio block, letting
+    /// the DAW poll block completion in shared memory without a syscall.
     pub response_counter: AtomicU32,
     /// Set to 1 by the DAW when it observes `response_counter` for block
     /// completion; the host then omits the per-block completion event byte
-    /// (it would otherwise pile up unread in the pipe). Previously part of
-    /// `_pad`.
+    /// (offset 92, previously padding).
     pub block_response_eventless: AtomicU32,
     _pad: [u8; 256 - 96],
 }
@@ -790,6 +792,9 @@ pub const REQUEST_CLAP_NOTE_NAMES: u32 = 11;
 
 /// Request type: refresh CLAP audio port counts in scratch.
 pub const REQUEST_CLAP_AUDIO_PORTS: u32 = 12;
+
+/// Request type: enumerate AudioUnit parameters (address, name, min, max, default).
+pub const REQUEST_AU_PARAMETERS: u32 = 13;
 
 // --- Static assertions for sizes ---
 
