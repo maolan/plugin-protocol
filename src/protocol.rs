@@ -22,6 +22,7 @@ pub const MAGIC: u32 = 0x4D41_4F4C;
 /// - `block_response_eventless` (offset 92): set to 1 by the DAW when it will
 ///   observe the counter; the host then skips writing the per-block
 ///   completion event byte (which would otherwise accumulate in the pipe).
+///
 /// Version 8: Added Cocoa GUI parent API tag and AudioUnit parameter request.
 pub const VERSION: u32 = 8;
 
