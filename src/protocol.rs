@@ -387,7 +387,8 @@ impl Default for ShmHeader {
 /// Zero-initialize the entire shared-memory region and write the header.
 ///
 /// # Safety
-/// `ptr` must be a valid pointer to a memory region of `size` bytes.
+/// `ptr` must be a valid pointer to a memory region of at least `HEADER_SIZE`
+/// bytes, aligned to `align_of::<ShmHeader>()`.
 pub unsafe fn init_shm_layout(ptr: *mut u8, size: usize) {
     unsafe {
         std::ptr::write_bytes(ptr, 0, size);
@@ -399,7 +400,8 @@ pub unsafe fn init_shm_layout(ptr: *mut u8, size: usize) {
 /// Returns a reference to the header at the start of the mapping.
 ///
 /// # Safety
-/// `ptr` must point to a valid allocation containing at least `ShmHeader`'s size.
+/// `ptr` must point to a valid allocation containing at least `ShmHeader`'s
+/// size and aligned to `align_of::<ShmHeader>()`.
 pub unsafe fn header_ref(ptr: *mut u8) -> &'static ShmHeader {
     unsafe { &*(ptr as *mut ShmHeader) }
 }
@@ -407,7 +409,8 @@ pub unsafe fn header_ref(ptr: *mut u8) -> &'static ShmHeader {
 /// Returns a mutable reference to the header.
 ///
 /// # Safety
-/// `ptr` must point to a valid allocation containing at least `ShmHeader`'s size.
+/// `ptr` must point to a valid allocation containing at least `ShmHeader`'s
+/// size and aligned to `align_of::<ShmHeader>()`.
 pub unsafe fn header_mut(ptr: *mut u8) -> &'static mut ShmHeader {
     unsafe { &mut *(ptr as *mut ShmHeader) }
 }
@@ -615,6 +618,64 @@ pub unsafe fn read_port_counts_from_scratch(ptr: *mut u8) -> Option<(u32, u32, u
         let midi_in = std::ptr::read_unaligned(src.add(12) as *mut u32);
         let midi_out = std::ptr::read_unaligned(src.add(16) as *mut u32);
         Some((audio_in, audio_out, midi_in, midi_out))
+    }
+}
+
+pub const MAIN_PORT_COUNTS_MAGIC: u32 = 0x4D41_494E;
+const MAIN_PORT_COUNTS_OFFSET: usize = PORT_COUNTS_OFFSET + 20;
+
+/// Write main audio channel counts alongside the total port counts.
+///
+/// This is an optional, backward-compatible extension: older readers stop
+/// before this payload, and older writers leave the magic unset.
+///
+/// # Safety
+/// `ptr` must point to a valid SHM allocation.
+pub unsafe fn write_main_port_counts_to_scratch(ptr: *mut u8, audio_in: u32, audio_out: u32) {
+    unsafe {
+        let dest = scratch_ptr(ptr).add(MAIN_PORT_COUNTS_OFFSET);
+        std::ptr::write_unaligned(dest as *mut u32, MAIN_PORT_COUNTS_MAGIC);
+        std::ptr::write_unaligned(dest.add(4) as *mut u32, audio_in);
+        std::ptr::write_unaligned(dest.add(8) as *mut u32, audio_out);
+    }
+}
+
+/// Read main audio channel counts from the optional extended port metadata.
+///
+/// # Safety
+/// `ptr` must point to a valid SHM allocation.
+pub unsafe fn read_main_port_counts_from_scratch(ptr: *mut u8) -> Option<(u32, u32)> {
+    unsafe {
+        let src = scratch_ptr(ptr).add(MAIN_PORT_COUNTS_OFFSET);
+        if std::ptr::read_unaligned(src as *mut u32) != MAIN_PORT_COUNTS_MAGIC {
+            return None;
+        }
+        let audio_in = std::ptr::read_unaligned(src.add(4) as *mut u32);
+        let audio_out = std::ptr::read_unaligned(src.add(8) as *mut u32);
+        Some((audio_in, audio_out))
+    }
+}
+
+/// Read total and main audio/MIDI port counts. If the host predates the main
+/// count extension, all audio channels are treated as main.
+///
+/// # Safety
+/// `ptr` must point to a valid SHM allocation.
+pub unsafe fn read_port_counts_with_main_from_scratch(
+    ptr: *mut u8,
+) -> Option<(u32, u32, u32, u32, u32, u32)> {
+    unsafe {
+        let (audio_in, audio_out, midi_in, midi_out) = read_port_counts_from_scratch(ptr)?;
+        let (main_audio_in, main_audio_out) =
+            read_main_port_counts_from_scratch(ptr).unwrap_or((audio_in, audio_out));
+        Some((
+            audio_in,
+            audio_out,
+            midi_in,
+            midi_out,
+            main_audio_in,
+            main_audio_out,
+        ))
     }
 }
 
@@ -833,6 +894,9 @@ pub fn wait_for_ready(header: &ShmHeader, timeout: std::time::Duration) -> bool 
 mod tests {
     use super::*;
 
+    #[repr(align(256))]
+    struct AlignedBytes<const N: usize>([u8; N]);
+
     #[test]
     fn response_counter_fields_live_at_offsets_88_and_92() {
         let header = ShmHeader::default();
@@ -855,11 +919,12 @@ mod tests {
 
     #[test]
     fn response_counter_handoff_roundtrip() {
-        let mut bytes = vec![0u8; HEADER_SIZE];
+        let mut bytes = AlignedBytes([0u8; HEADER_SIZE]);
+        let ptr = bytes.0.as_mut_ptr();
         unsafe {
-            init_shm_layout(bytes.as_mut_ptr(), bytes.len());
+            init_shm_layout(ptr, bytes.0.len());
         }
-        let header = unsafe { header_ref(bytes.as_mut_ptr()) };
+        let header = unsafe { header_ref(ptr) };
         assert_eq!(header.block_response_count(), 0);
         assert!(!header.block_response_eventless());
 
@@ -869,11 +934,48 @@ mod tests {
         // DAW side: reads the counter through the raw-pointer helper, the
         // same view an engine built against 0.0.18 has of padding bytes
         // (zero, so its spin fast path simply never triggers).
-        let counter = unsafe { response_counter_ref(bytes.as_mut_ptr()) };
+        let counter = unsafe { response_counter_ref(ptr) };
         assert_eq!(counter.load(Ordering::Acquire), 2);
         assert_eq!(header.block_response_count(), 2);
 
         header.set_block_response_eventless(true);
         assert!(header.block_response_eventless());
+    }
+
+    #[test]
+    fn port_counts_preserve_total_and_main_audio_channels() {
+        let mut storage = Vec::<AlignedBytes<SHM_SIZE>>::with_capacity(1);
+        let ptr = storage.as_mut_ptr().cast::<u8>();
+        unsafe {
+            init_shm_layout(ptr, SHM_SIZE);
+            write_port_counts_to_scratch(ptr, 4, 2, 1, 0);
+            write_main_port_counts_to_scratch(ptr, 2, 2);
+        }
+
+        unsafe {
+            assert_eq!(read_port_counts_from_scratch(ptr), Some((4, 2, 1, 0)));
+            assert_eq!(
+                read_port_counts_with_main_from_scratch(ptr),
+                Some((4, 2, 1, 0, 2, 2))
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_port_counts_treat_all_audio_channels_as_main() {
+        let mut storage = Vec::<AlignedBytes<SHM_SIZE>>::with_capacity(1);
+        let ptr = storage.as_mut_ptr().cast::<u8>();
+        unsafe {
+            init_shm_layout(ptr, SHM_SIZE);
+            write_port_counts_to_scratch(ptr, 4, 2, 1, 0);
+        }
+
+        unsafe {
+            assert_eq!(read_main_port_counts_from_scratch(ptr), None);
+            assert_eq!(
+                read_port_counts_with_main_from_scratch(ptr),
+                Some((4, 2, 1, 0, 4, 2))
+            );
+        }
     }
 }
